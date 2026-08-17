@@ -1,0 +1,40 @@
+Metadata-Version: 2.4
+Name: cointeract
+Version: 1.0.0
+Summary: CoInteract: Spatially-Structured Co-Generation for Interactive Human-Object Video Synthesis
+Author: CoInteract Authors
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+License-File: LICENSE
+Requires-Dist: torch>=2.1.0
+Requires-Dist: torchvision
+Requires-Dist: transformers>=4.40.0
+Requires-Dist: safetensors
+Requires-Dist: einops
+Requires-Dist: sentencepiece
+Requires-Dist: protobuf
+Requires-Dist: deepspeed>=0.14.0
+Requires-Dist: accelerate>=0.34.0
+Requires-Dist: peft>=0.10.0
+Requires-Dist: lightning
+Requires-Dist: numpy<2.0,>=1.26.0
+Requires-Dist: pandas>=2.1.0
+Requires-Dist: imageio
+Requires-Dist: imageio[ffmpeg]
+Requires-Dist: librosa
+Requires-Dist: Pillow
+Requires-Dist: ftfy
+Requires-Dist: regex
+Requires-Dist: wcwidth
+Requires-Dist: pydantic>=2.0
+Requires-Dist: pynvml
+Requires-Dist: huggingface_hub
+Requires-Dist: modelscope
+Dynamic: author
+Dynamic: classifier
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

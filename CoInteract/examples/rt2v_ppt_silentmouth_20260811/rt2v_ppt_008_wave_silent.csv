@@ -1,0 +1,2 @@
+sample_id,prompt,audio,person_image,product_image,pose_video
+rt2v_ppt_008_wave_silent,"Wave slowly with both hands for greeting. The person is silent. Lips stay gently closed and stable for the whole video; no speech, no talking, no singing, no mouth opening. Keep a friendly closed-mouth expression while waving.",,/data1/workspace/linxinliang/InteractAvatar/InterDemo/test_data/ref_img/halfbody/fullImage8c4fd21edc6476f7c9735ad6b728c1e9d4e355e1.jpg,,

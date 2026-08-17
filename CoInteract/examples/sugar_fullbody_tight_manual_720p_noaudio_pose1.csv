@@ -1,0 +1,2 @@
+sample_id,prompt,audio,person_image,product_image,pose_video
+th_fullbody_sugar_pose1_tightmanual_720p_noaudio,"A full-body person follows the provided motion with stable facial identity, stable eyes, stable nose, stable lips, stable jawline, stable whole-body proportions, and natural full-body framing.",,/data1/workspace/linxinliang/CoInteract/examples/compare_person_images/sugar_fullbody_tight_manual.jpg,,/data1/workspace/linxinliang/InteractAvatar/InterDemo/TalkingHumanDemo_fullbody/test_data/motion_pose/004_motion1_pose.mp4

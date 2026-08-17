@@ -1,0 +1,137 @@
+"""
+HJB face-optimization for CoInteract (StableAnimator's inference-time ID trick), Ascend-NPU friendly.
+
+Core idea: during (the last K steps of) sampling, take the predicted clean latent x0,
+VAE-decode it, crop the face, embed with a *differentiable* ArcFace, and run a few Adam
+steps on x0 to maximize cosine similarity with the reference identity. Training-free.
+
+Pieces:
+  - DifferentiableArcFace : onnx2torch-converted w600k_r50, RGB[-1,1] in -> 512-d emb (grad flows)
+  - hjb_optimize_latent   : the Adam inner-loop over a clean-latent estimate
+Both are model-agnostic; the pipeline calls them with its own VAE + x0.
+"""
+from __future__ import annotations
+import torch
+import torch.nn.functional as F
+
+
+class DifferentiableArcFace(torch.nn.Module):
+    """Wraps the onnx2torch-converted ArcFace. Input faces are RGB in [-1,1]
+    (VAE output range == ArcFace's (x-127.5)/127.5 range), shape [N,3,H,W]."""
+    def __init__(self, onnx_path: str, device="npu", dtype=torch.float32):
+        super().__init__()
+        from onnx2torch import convert
+        self.net = convert(onnx_path).to(device=device, dtype=dtype).eval()
+        for p in self.net.parameters():
+            p.requires_grad_(False)          # ArcFace itself is frozen; grad flows to the INPUT
+        self.device, self.dtype = device, dtype
+
+    def embed(self, faces_rgb_m1p1: torch.Tensor) -> torch.Tensor:
+        # auto-sync the ArcFace net to wherever the inputs live (onnx2torch .to() can be flaky)
+        dev = faces_rgb_m1p1.device
+        if next(self.net.parameters()).device != dev:
+            self.net = self.net.to(dev)
+        f = faces_rgb_m1p1.to(dev, self.dtype)
+        if f.shape[-2:] != (112, 112):
+            f = F.interpolate(f, size=(112, 112), mode="bilinear", align_corners=False)
+        e = self.net(f)                       # [N,512]
+        return F.normalize(e, dim=-1)
+
+
+def _crop_faces(frames_rgb: torch.Tensor, bbox, margin=0.2):
+    """frames_rgb: [T,3,H,W] in [-1,1]; bbox=(x1,y1,x2,y2) in pixel coords of (H,W).
+    Returns [T,3,112,112] crops (differentiable slice+resize)."""
+    T, C, H, W = frames_rgb.shape
+    x1, y1, x2, y2 = bbox
+    bw, bh = x2 - x1, y2 - y1
+    x1 = max(0, int(x1 - margin * bw)); y1 = max(0, int(y1 - margin * bh))
+    x2 = min(W, int(x2 + margin * bw)); y2 = min(H, int(y2 + margin * bh))
+    crop = frames_rgb[:, :, y1:y2, x1:x2]
+    return F.interpolate(crop, size=(112, 112), mode="bilinear", align_corners=False)
+
+
+def _even_frame_indices(num_frames: int, sample_count: int):
+    if num_frames <= 1 or sample_count <= 1:
+        return [max(0, num_frames // 2)]
+    count = min(sample_count, num_frames)
+    return sorted({round(i * (num_frames - 1) / (count - 1)) for i in range(count)})
+
+
+@torch.enable_grad()
+def hjb_optimize_latent(x0, vae, arcface: DifferentiableArcFace, ref_emb,
+                        bbox, frame_idxs, n_steps=8, lr=0.05, decode_fn=None):
+    """Adam inner-loop on a clean-latent estimate x0 to raise ArcFace cos vs ref_emb.
+      x0        : [B,C,T,h,w] clean-latent estimate (leaf we optimize a copy of)
+      decode_fn : callable(latent)->frames[B,3,T,H,W] in [-1,1] (pipeline-supplied VAE decode)
+      bbox      : face box in decoded-pixel coords ; frame_idxs: which T to score (cheap subset)
+    Returns the refined x0 (detached)."""
+    z = x0.detach().clone().requires_grad_(True)
+    opt = torch.optim.Adam([z], lr=lr)
+    ref = F.normalize(ref_emb.to(arcface.device, arcface.dtype).reshape(1, -1), dim=-1)
+    for _ in range(n_steps):
+        opt.zero_grad(set_to_none=True)
+        frames = (decode_fn(z) if decode_fn else vae.decode(z))     # [B,3,T,H,W] in [-1,1]
+        fr = frames[0].permute(1, 0, 2, 3)[frame_idxs]              # [k,3,H,W]
+        faces = _crop_faces(fr, bbox)
+        emb = arcface.embed(faces)                                  # [k,512]
+        ref_step = ref.to(device=emb.device, dtype=emb.dtype)
+        loss = (1.0 - (emb @ ref_step.T).squeeze(-1)).mean()       # maximize cosine
+        loss.backward()
+        opt.step()
+    return z.detach()
+
+
+@torch.enable_grad()
+def hjb_refine_latent(vae, latent, ref_emb, arcface, bbox, device,
+                      decode_lat_frames=4, n_steps=4, lr=0.05, tiled=False,
+                      target_cosine=None, min_steps=0, score_frame_count=3):
+    """Pipeline-facing HJB: refine a FINAL denoised `latent` [B,C,T,h,w] toward the
+    reference identity, bounding memory by decoding only the first `decode_lat_frames`
+    latent frames (Wan VAE is causal -> ~4*k-3 RGB frames). Returns refined latent.
+    Call between `pipe(..., return_latents=True)` and `pipe.vae.decode(...)`."""
+    z = latent.detach().clone().to(device).requires_grad_(True)
+    opt = torch.optim.Adam([z], lr=lr)
+    ref = F.normalize(ref_emb.to(device, torch.float32).reshape(1, -1), dim=-1)
+    print(
+        f"[HJB] start: z={tuple(z.shape)}, decode_lat_frames={decode_lat_frames}, "
+        f"steps={n_steps}, lr={lr}, tiled={tiled}, target_cosine={target_cosine}, "
+        f"min_steps={min_steps}, score_frame_count={score_frame_count}",
+        flush=True,
+    )
+    for step_idx in range(n_steps):
+        print(f"[HJB] step {step_idx + 1}/{n_steps}: zero_grad", flush=True)
+        opt.zero_grad(set_to_none=True)
+        zt = z[:, :, :decode_lat_frames]
+        print(f"[HJB] step {step_idx + 1}/{n_steps}: before vae.decode zt={tuple(zt.shape)}", flush=True)
+        frames = vae.decode(zt, device=device, tiled=tiled)        # [B,3,T,H,W]
+        print(f"[HJB] step {step_idx + 1}/{n_steps}: after vae.decode frames={tuple(frames.shape)}", flush=True)
+        fr = frames[0].permute(1, 0, 2, 3)                         # [T,3,H,W]
+        frame_idxs = _even_frame_indices(fr.shape[0], score_frame_count)
+        faces = _crop_faces(fr[frame_idxs], bbox)
+        print(f"[HJB] step {step_idx + 1}/{n_steps}: before ArcFace faces={tuple(faces.shape)}", flush=True)
+        emb = arcface.embed(faces.float())
+        print(f"[HJB] step {step_idx + 1}/{n_steps}: after ArcFace emb={tuple(emb.shape)}", flush=True)
+        ref_step = ref.to(device=emb.device, dtype=emb.dtype)
+        cos = (emb @ ref_step.T).squeeze(-1)
+        loss = (1.0 - cos).mean()
+        cos_mean = float(cos.mean().detach().cpu().item())
+        cos_min = float(cos.min().detach().cpu().item())
+        print(
+            f"[HJB] step {step_idx + 1}/{n_steps}: score frame_idxs={frame_idxs} "
+            f"cos_mean={cos_mean:.6f} cos_min={cos_min:.6f}",
+            flush=True,
+        )
+        if target_cosine is not None and step_idx >= min_steps and cos_mean >= target_cosine:
+            print(
+                f"[HJB] target reached before backward: cos_mean={cos_mean:.6f} "
+                f">= {target_cosine:.6f}",
+                flush=True,
+            )
+            break
+        print(f"[HJB] step {step_idx + 1}/{n_steps}: before backward loss={float(loss.detach().cpu().item()):.6f}", flush=True)
+        loss.backward()
+        print(f"[HJB] step {step_idx + 1}/{n_steps}: after backward", flush=True)
+        opt.step()
+        print(f"[HJB] step {step_idx + 1}/{n_steps}: after opt.step", flush=True)
+    print("[HJB] done", flush=True)
+    return z.detach().to(latent.dtype)

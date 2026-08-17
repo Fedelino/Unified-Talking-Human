@@ -1,0 +1,733 @@
+"""
+CoInteract Training Script
+
+Trains the Human-Aware MoE model with:
+- Spatially-Structured Co-Generation (RGB + HOI depth dual-stream)
+- Human-Aware Mixture-of-Experts (hand_expert + face_expert + router)
+- Audio Face Mask (audio cross-attention controls face region only)
+- Joint Encoding strategy (motion + input concatenated before VAE to avoid flickering)
+- Router supervision via spatial GT bounding boxes
+
+Usage:
+    deepspeed --num_gpus=8 examples/wanvideo/model_training/train.py \
+        --model_paths '<json_list_of_model_paths>' \
+        --use_moe --expert_hidden_dim 1280 \
+        --use_audio_face_mask --audio_mask_train_source gt \
+        --use_hoi_branch --depth_mutual_visible \
+        --dataset_metadata_path data.csv \
+        --extra_inputs person_image,product_image \
+        --output_path ./output
+"""
+import torch
+import os
+import json
+import math
+import random
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+try:
+    import torch_npu  # noqa: F401
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+except Exception:
+    pass
+
+from diffsynth import load_state_dict
+from diffsynth.pipelines.wan_video_new_consisid import WanVideoPipeline, ModelConfig
+from diffsynth.trainers.utils import (
+    DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
+)
+from diffsynth.trainers.unified_dataset import (
+    UnifiedDataset, LoadVideo, LoadVideoFramesOnly, LoadAudio, LoadImage,
+    ImageCropAndResize, ImageResizeAndPad, ToAbsolutePath
+)
+from diffsynth.utils.bbox_utils import create_masks_from_metadata
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def _to_bgr_array(image):
+    """Convert a PIL/numpy/tensor image into uint8 BGR for face embedding."""
+    from PIL import Image
+
+    if isinstance(image, Image.Image):
+        rgb = np.array(image.convert("RGB"))
+    elif isinstance(image, np.ndarray):
+        arr = image
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        if arr.shape[-1] == 4:
+            arr = arr[..., :3]
+        rgb = arr.astype(np.uint8) if arr.dtype != np.uint8 else arr
+    elif torch.is_tensor(image):
+        t = image.detach().float().cpu()
+        if t.ndim == 4:
+            t = t[0]
+        if t.ndim == 3 and t.shape[0] in (1, 3):
+            t = t.permute(1, 2, 0)
+        arr = t.numpy()
+        if arr.max() <= 2.0:
+            arr = (arr + 1.0) * 127.5 if arr.min() < 0 else arr * 255.0
+        rgb = np.clip(arr, 0, 255).astype(np.uint8)
+    else:
+        raise TypeError(f"Unsupported image type for ArcFace: {type(image)!r}")
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+class ArcFaceReferenceEncoder:
+    """Small CPU ArcFace wrapper for ConsisID training smoke/caching."""
+
+    def __init__(self, onnx_path, precomputed_npz=None):
+        import onnxruntime as ort
+
+        onnx_path = Path(onnx_path)
+        if not onnx_path.is_file():
+            raise FileNotFoundError(f"ArcFace ONNX not found: {onnx_path}")
+        self.sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        self.input = self.sess.get_inputs()[0]
+        self.input_name = self.input.name
+        shape = self.input.shape
+        h = shape[2] if isinstance(shape[2], int) else 112
+        w = shape[3] if isinstance(shape[3], int) else 112
+        self.size = (int(w), int(h))
+        self.output_name = self.sess.get_outputs()[0].name
+        self.detector = None
+        if hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades"):
+            xml = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+            detector = cv2.CascadeClassifier(xml)
+            if not detector.empty():
+                self.detector = detector
+        if self.detector is None:
+            print("[ConsisID] OpenCV Haar detector unavailable; using fallback upper-face crop")
+        self.cache = {}
+        # Precomputed insightface-aligned ArcFace embeddings (SCRFD det + 5-pt norm_crop
+        # + w600k_r50), keyed by the raw CSV person_image path. Far higher quality than
+        # the inline Haar/fallback crop; the inline path stays as a fallback for misses.
+        self.pre = {}
+        if precomputed_npz and os.path.isfile(precomputed_npz):
+            import numpy as _np
+            _z = _np.load(precomputed_npz, allow_pickle=True)
+            _k = _z["keys"]; _e = _z["embs"]; _dch = _z["detected"]
+            for _i in range(len(_k)):
+                if bool(_dch[_i]):
+                    self.pre[str(_k[_i])] = _e[_i].astype("float32")
+            print(f"[ConsisID] loaded precomputed ArcFace cache: {len(self.pre)}/{len(_k)} aligned embeddings from {precomputed_npz}")
+
+    def _largest_face(self, bgr):
+        if self.detector is None:
+            return None
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        faces = self.detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(24, 24))
+        if len(faces) == 0:
+            return None
+        x, y, w, h = max(faces, key=lambda box: box[2] * box[3])
+        return int(x), int(y), int(x + w), int(y + h)
+
+    @staticmethod
+    def _fallback_upper_face_box(bgr):
+        h, w = bgr.shape[:2]
+        # Dataset samples are mostly centered humans; this keeps smoke robust if Haar misses.
+        return int(0.30 * w), int(0.04 * h), int(0.70 * w), int(0.42 * h)
+
+    @staticmethod
+    def _crop(bgr, box, margin=0.20):
+        h, w = bgr.shape[:2]
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        x1 = max(0, int(x1 - margin * bw))
+        y1 = max(0, int(y1 - margin * bh))
+        x2 = min(w, int(x2 + margin * bw))
+        y2 = min(h, int(y2 + margin * bh))
+        return bgr[y1:y2, x1:x2]
+
+    def _embed_crop(self, crop_bgr):
+        img = cv2.resize(crop_bgr, self.size, interpolation=cv2.INTER_LINEAR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+        img = (img - 127.5) / 127.5
+        blob = np.transpose(img, (2, 0, 1))[None, ...]
+        emb = self.sess.run([self.output_name], {self.input_name: blob})[0][0]
+        return (emb / (np.linalg.norm(emb) + 1e-9)).astype(np.float32)
+
+    def encode(self, image, image_path=None):
+        key = str(image_path or "")
+        if key and key in self.cache:
+            return self.cache[key]
+        if key and key in self.pre:
+            return self.pre[key], True
+        bgr = cv2.imread(key, cv2.IMREAD_COLOR) if key and os.path.isfile(key) else None
+        if bgr is None:
+            bgr = _to_bgr_array(image)
+        box = self._largest_face(bgr)
+        detected = box is not None
+        if box is None:
+            box = self._fallback_upper_face_box(bgr)
+        crop = self._crop(bgr, box)
+        emb = self._embed_crop(crop)
+        if key:
+            self.cache[key] = (emb, detected)
+        return emb, detected
+
+
+def load_wan_image_encoder_fallback(checkpoint_path):
+    """Load Wan CLIP image encoder when ModelManager cannot auto-detect the file."""
+    from diffsynth.models.wan_video_image_encoder import WanImageEncoder
+
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Wan image encoder checkpoint not found: {checkpoint_path}")
+    encoder = WanImageEncoder().eval()
+    state_dict = load_state_dict(str(checkpoint_path), torch_dtype=None, device="cpu")
+    state_dict = encoder.state_dict_converter().from_civitai(state_dict)
+    missing, unexpected = encoder.load_state_dict(state_dict, strict=False)
+    for param in encoder.parameters():
+        param.requires_grad_(False)
+    print(
+        "[ConsisID] manually loaded Wan image_encoder "
+        f"from {checkpoint_path} (missing={len(missing)}, unexpected={len(unexpected)})"
+    )
+    return encoder
+
+
+class WanTrainingModule(DiffusionTrainingModule):
+    """
+    Training module for CoInteract with MoE, Audio Face Mask, and Depth Branch.
+    """
+
+    def __init__(
+        self,
+        model_paths=None,
+        model_id_with_origin_paths=None,
+        trainable_models=None,
+        lora_base_model=None,
+        lora_target_modules="q,k,v,o,ffn.0,ffn.2",
+        lora_rank=32,
+        lora_checkpoint=None,
+        use_gradient_checkpointing=True,
+        use_gradient_checkpointing_offload=False,
+        extra_inputs=None,
+        max_timestep_boundary=1.0,
+        min_timestep_boundary=0.0,
+        height=480,
+        width=832,
+        use_moe=False,
+        expert_hidden_dim=None,
+        use_depth_branch=False,
+        depth_mutual_visible=True,
+        use_deepspeed_activation_checkpointing=False,
+        train_shift=None,
+        use_audio_face_mask=False,
+        audio_mask_train_source="gt",
+        pose_dropout_prob=0.5,
+        face_loss_weight=1.0,
+    ):
+        super().__init__()
+
+        # Parse and load model weights
+        model_configs = self.parse_model_configs(
+            model_paths, model_id_with_origin_paths, enable_fp8_training=False
+        )
+        audio_model_configs = ModelConfig(
+            path=os.environ.get("AUDIO_ENCODER_DIR", ""),
+            offload_dtype=None
+        )
+        tokenizer_config = ModelConfig(
+            path=os.environ.get("TOKENIZER_DIR", ""),
+            offload_dtype=None
+        )
+        self.pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device="cpu",
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            audio_processor_config=audio_model_configs,
+        )
+        if os.environ.get('CONSISID', '0') == '1' and self.pipe.image_encoder is None:
+            self.pipe.image_encoder = load_wan_image_encoder_fallback(
+                os.environ.get(
+                    "IMAGE_ENCODER_PATH",
+                    "/data1/Wan-AI/wan21_14b_480p/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+                )
+            )
+
+        # --- Enable Human-Aware MoE FFN ---
+        # Must be done after loading weights but before adding LoRA
+        if use_moe:
+            if hasattr(self.pipe, 'dit') and hasattr(self.pipe.dit, 'enable_moe_ffn'):
+                self.pipe.dit.enable_moe_ffn(expert_hidden_dim=expert_hidden_dim)
+                print(f"[MoE] Enabled with expert_hidden_dim={expert_hidden_dim}")
+                # Update LoRA target paths for MoE structure
+                if 'ffn.0' in lora_target_modules or 'ffn.2' in lora_target_modules:
+                    lora_target_modules = lora_target_modules.replace(
+                        'ffn.0', 'ffn.ffn_base.0'
+                    ).replace('ffn.2', 'ffn.ffn_base.2')
+                    print(f"[MoE] Updated lora_target_modules: {lora_target_modules}")
+
+        # --- Enable Audio Face Mask ---
+        # Constrains audio cross-attention residual to face region only
+        if use_audio_face_mask:
+            if hasattr(self.pipe, 'dit') and hasattr(self.pipe.dit, 'set_audio_face_mask_config'):
+                self.pipe.dit.set_audio_face_mask_config(
+                    use_audio_face_mask=True,
+                    audio_mask_train_source=audio_mask_train_source,
+                )
+                print(f"[Audio Face Mask] Enabled (source={audio_mask_train_source})")
+
+        # --- Enable Depth Video Branch (Spatially-Structured Co-Generation) ---
+        self.use_depth_branch = use_depth_branch
+        if use_depth_branch:
+            if hasattr(self.pipe, 'dit') and hasattr(self.pipe.dit, 'enable_depth_branch'):
+                self.pipe.dit.enable_depth_branch()
+                print("[Depth Branch] Enabled")
+
+        # Switch to training mode: apply LoRA / freeze layers
+        self.switch_pipe_to_training_mode(
+            self.pipe, trainable_models,
+            lora_base_model, lora_target_modules, lora_rank,
+            lora_checkpoint=lora_checkpoint,
+            enable_fp8_training=False,
+            use_moe=use_moe,
+            use_depth_branch=use_depth_branch,
+            train_shift=train_shift,
+        )
+
+        # --- Set MoE experts + router to full training ---
+        if use_moe and hasattr(self.pipe, 'dit'):
+            moe_param_count = 0
+            for block in self.pipe.dit.blocks:
+                if hasattr(block, 'ffn') and hasattr(block.ffn, 'router'):
+                    for name, param in block.ffn.named_parameters():
+                        if 'hand_expert' in name or 'face_expert' in name:
+                            param.requires_grad = True
+                            moe_param_count += param.numel()
+                    for param in block.ffn.router.parameters():
+                        param.requires_grad = True
+                        moe_param_count += param.numel()
+            print(f"[MoE] {moe_param_count:,} params set to full training")
+
+        # --- Load FROZEN OG CoInteract (LoRA+MoE) so ConsisID trains on the DEPLOYED base ---
+        # Fixes train/infer mismatch: inference runs base+OG-LoRA+MoE, so training must too.
+        _og_ckpt = os.environ.get("OG_COINTERACT_CKPT", "")
+        if os.environ.get("CONSISID", "0") == "1" and _og_ckpt:
+            if not os.path.isfile(_og_ckpt):
+                raise FileNotFoundError(f"[ConsisID] OG CoInteract checkpoint not found: {_og_ckpt}")
+            print(f"[ConsisID] Loading FROZEN OG CoInteract: {_og_ckpt}")
+            self.pipe.load_lora(module=self.pipe.dit, lora_config=_og_ckpt, alpha=1.0)
+            print("[ConsisID] OG LoRA merged (alpha=1.0)")
+            if use_moe:
+                _ck = load_state_dict(_og_ckpt, torch_dtype=torch.bfloat16, device="cpu")
+                _moe_keys = ("router", "hand_expert", "face_expert")
+                _msd = {}
+                for _k in _ck:
+                    if not any(_t in _k for _t in _moe_keys):
+                        continue
+                    _mk = _k[len("diffusion_model."):] if _k.startswith("diffusion_model.") else _k
+                    _msd[_mk] = _ck[_k]
+                self.pipe.dit.load_state_dict(_msd, strict=False)
+                print(f"[ConsisID] OG MoE loaded: {len(_msd)} weights")
+            for _p in self.pipe.dit.parameters():
+                _p.requires_grad_(False)
+            print("[ConsisID] froze full OG CoInteract base (LoRA+MoE); only ConsisID trains")
+
+        # --- ConsisID: attach identity pathway; train ONLY these (base frozen) ---
+        if os.environ.get('CONSISID', '0') == '1':
+            from diffsynth.models.consisid_faithful import LocalFacialExtractor, PerceiverCrossAttention
+            import torch.nn as _cnn
+            _d = self.pipe.dit
+            _p0 = next(_d.parameters()); _dt = _p0.dtype; _dev = _p0.device
+            if self.pipe.image_encoder is None:
+                raise RuntimeError(
+                    "[ConsisID] Wan image_encoder is not loaded. Add "
+                    "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth to MODEL_PATHS."
+                )
+            _d.consisid_interval = int(os.environ.get("CONSISID_INTERVAL", "8"))
+            _d.consisid_start_block = int(os.environ.get("CONSISID_START_BLOCK", "32"))
+            _extractor_depth = int(os.environ.get("CONSISID_EXTRACTOR_DEPTH", "1"))
+            _num_queries = int(os.environ.get("CONSISID_NUM_QUERIES", "4"))
+            _id_token_dim = int(os.environ.get("CONSISID_ID_TOKEN_DIM", "512"))
+            _cross_heads = int(os.environ.get("CONSISID_CROSS_HEADS", "4"))
+            _cross_dim_head = int(os.environ.get("CONSISID_CROSS_DIM_HEAD", "32"))
+            _d.consisid_extractor = LocalFacialExtractor(
+                id_dim=512,
+                vit_dim=1280,
+                depth=_extractor_depth,
+                num_scale=1,
+                num_queries=_num_queries,
+                output_dim=_id_token_dim,
+            ).to(_dev, _dt)
+            _active_blocks = max(0, len(_d.blocks) - _d.consisid_start_block)
+            _nca = max(1, (_active_blocks + _d.consisid_interval - 1) // _d.consisid_interval)
+            _d.consisid_cross_attn = _cnn.ModuleList([
+                PerceiverCrossAttention(
+                    dim=5120,
+                    kv_dim=_id_token_dim,
+                    heads=_cross_heads,
+                    dim_head=_cross_dim_head,
+                ).to(_dev, _dt)
+                for _ in range(_nca)
+            ])
+            _d._consisid_enabled = True
+            _cp = 0
+            for _pp in _d.consisid_extractor.parameters(): _pp.requires_grad = True; _cp += _pp.numel()
+            for _pp in _d.consisid_cross_attn.parameters(): _pp.requires_grad = True; _cp += _pp.numel()
+            self._consisid = True
+            self._consisid_arcface = ArcFaceReferenceEncoder(
+                os.environ.get("ARC_FACE_ONNX", "models/arcface/w600k_r50.onnx"),
+                precomputed_npz=os.environ.get("ARC_FACE_CACHE", "models/arcface/personimg_arcface_cache.npz"),
+            )
+            self._consisid_debug_printed = False
+            print(
+                "[ConsisID] attached + trainable: "
+                f"{_cp/1e6:.0f}M params ({_nca} cross-attn blocks, "
+                f"start_block={_d.consisid_start_block}, interval={_d.consisid_interval}, "
+                f"queries={_num_queries}, "
+                f"id_token_dim={_id_token_dim}, cross_heads={_cross_heads}, "
+                f"cross_dim_head={_cross_dim_head}, extractor_depth={_extractor_depth})"
+            )
+        else:
+            self._consisid = False
+            self._consisid_arcface = None
+            self._consisid_debug_printed = False
+
+        # --- Set Depth Branch parameters to full training ---
+        if use_depth_branch and hasattr(self.pipe, 'dit') and self.pipe.dit.is_depth_branch_enabled():
+            depth_param_count = 0
+            for attr in ['depth_patch_embedding', 'depth_head', 'depth_cond_mask']:
+                module = getattr(self.pipe.dit, attr, None)
+                if module is not None:
+                    for param in module.parameters():
+                        param.requires_grad = True
+                        depth_param_count += param.numel()
+            for block in self.pipe.dit.blocks:
+                if hasattr(block, 'depth_modulation'):
+                    block.depth_modulation.requires_grad = True
+                    depth_param_count += block.depth_modulation.numel()
+            print(f"[Depth Branch] {depth_param_count:,} params set to full training")
+
+        # Store training configs
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
+        self.use_deepspeed_activation_checkpointing = use_deepspeed_activation_checkpointing
+        self.extra_inputs = extra_inputs.split(",") if extra_inputs else []
+        self.max_timestep_boundary = max_timestep_boundary
+        self.min_timestep_boundary = min_timestep_boundary
+        self.height = height
+        self.width = width
+        self.depth_mutual_visible = depth_mutual_visible
+        self.pose_dropout_prob = pose_dropout_prob
+        self.face_loss_weight = face_loss_weight
+
+        # Router supervision config
+        self.enable_router_supervision = True
+        self.vae_scale_factor = 8
+        self.patch_size = (2, 2)
+
+    def forward_preprocess(self, data):
+        """Preprocess a training sample into pipeline inputs."""
+        # Prompt with 10% CFG dropout
+        inputs_posi = {"prompt": data["prompt"] if random.random() > 0.1 else ""}
+        inputs_nega = {}
+
+        num_frames = 81
+        motion_video = data.get("motion_video", [])
+        input_video = data.get("input_video", None)
+        person_image = data["person_image"]
+
+        # Motion dropout (40% probability)
+        motion_dropped = random.random() < 0.4
+        if motion_dropped:
+            motion_video = []
+
+        if input_video is None:
+            raise ValueError(
+                f"input_video is None for sample: {data.get('prompt', 'N/A')}. "
+                "Check your dataset CSV."
+            )
+
+        # --- Joint Encoding Strategy ---
+        # Concatenate motion_video + input_video before VAE encode to maintain
+        # temporal continuity (Causal Conv3d) and avoid flickering artifacts.
+        has_motion_video = len(motion_video) > 0
+        if has_motion_video:
+            # Combine: motion (73 frames) + input[:80] = 153 frames total
+            # VAE encodes jointly -> 39 latents (19 motion + 20 target)
+            input_video = motion_video + input_video[:80]
+            motion_video = []
+        else:
+            # No motion context: use person_image as first frame
+            input_video[0] = person_image
+
+        # HOI video for Spatially-Structured Co-Generation
+        # CSV column is `hoi_video` (user-facing name); internally we still route
+        # it through the pipeline under the legacy `depth_video` key.
+        depth_video = data.get("hoi_video", None)
+        if depth_video is not None and not isinstance(depth_video, float) and len(depth_video) > 0:
+            pass  # Use as-is
+        else:
+            depth_video = None
+
+        # Pose video for pose-driven conditioning (optional).
+        # CSV empty cells are parsed as NaN (float), so explicitly filter them out.
+        pose_video = data.get("pose_video", None)
+        if pose_video is not None and not isinstance(pose_video, float) and len(pose_video) > 0:
+            # Dropout supports CFG-style pose guidance at inference time.
+            if random.random() < self.pose_dropout_prob:
+                pose_video = None
+        else:
+            pose_video = None
+
+        inputs_shared = {
+            "input_video": input_video,
+            "input_audio": data["audio"],
+            "height": self.height,
+            "width": self.width,
+            "num_frames": num_frames,
+            "audio_embeds": None,
+            "s2v_pose_latents": None,
+            "s2v_pose_video": pose_video,
+            "motion_video": motion_video,
+            "depth_video": depth_video,
+            "start_idx": 0,
+            # Pipeline config (do not modify)
+            "cfg_scale": 1,
+            "tiled": False,
+            "rand_device": self.pipe.device,
+            "use_gradient_checkpointing": self.use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+            "cfg_merge": False,
+            "vace_scale": 1,
+            "max_timestep_boundary": self.max_timestep_boundary,
+            "min_timestep_boundary": self.min_timestep_boundary,
+            "face_loss_weight": self.face_loss_weight,
+        }
+
+        # Handle extra inputs (person_image, product_image, etc.)
+        for extra_input in self.extra_inputs:
+            if extra_input == "person_image":
+                # Pipeline I2V units internally use the "input_image" key.
+                inputs_shared["input_image"] = data["person_image"]
+            elif extra_input == "product_image":
+                inputs_shared["product_image"] = data.get("product_image", None)
+                product_image_scale = data.get("scale", 1.0)
+                if product_image_scale is None or (isinstance(product_image_scale, float) and math.isnan(product_image_scale)):
+                    product_image_scale = 1.0
+                inputs_shared["product_image_scale"] = product_image_scale
+            elif extra_input == "end_image":
+                inputs_shared["end_image"] = data["video"][-1]
+            elif extra_input in ("reference_image", "vace_reference_image"):
+                inputs_shared[extra_input] = data[extra_input][0]
+            else:
+                inputs_shared[extra_input] = data[extra_input]
+
+        # Run pipeline units (VAE encode, text encode, audio encode, etc.)
+        for unit in self.pipe.units:
+            inputs_shared, inputs_posi, inputs_nega = self.pipe.unit_runner(
+                unit, self.pipe, inputs_shared, inputs_posi, inputs_nega
+            )
+
+        # Audio CFG dropout (10%)
+        if random.random() < 0.1:
+            inputs_posi["audio_embeds"] = inputs_nega["audio_embeds"].clone()
+
+        # --- Build spatial masks for MoE Router Supervision ---
+        if self.enable_router_supervision:
+            face_bbox_str = data.get("face", "")
+            hand_bbox_str = data.get("hand_object", "")
+            orig_height = data.get("height", None)
+            orig_width = data.get("width", None)
+
+            latent_h = self.height // self.vae_scale_factor
+            latent_w = self.width // self.vae_scale_factor
+            num_frames_latent = 20  # (81 - 1) // 4
+
+            if orig_height is None or orig_width is None:
+                raise ValueError(
+                    "CSV missing 'height'/'width' fields required for bbox conversion."
+                )
+
+            face_mask, hand_mask = create_masks_from_metadata(
+                face_bbox_str=face_bbox_str,
+                hand_bbox_str=hand_bbox_str,
+                num_frames=num_frames_latent,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                patch_size=self.patch_size,
+                original_size=(orig_height, orig_width),
+                target_size=(self.height, self.width),
+                vae_scale_factor=self.vae_scale_factor,
+                device=self.pipe.device,
+            )
+            inputs_shared["face_mask"] = face_mask
+            inputs_shared["hand_mask"] = hand_mask
+
+        inputs_shared["depth_mutual_visible"] = self.depth_mutual_visible
+        return {**inputs_shared, **inputs_posi}
+
+    def forward(self, data, inputs=None):
+        """Compute training loss."""
+        if inputs is None:
+            inputs = self.forward_preprocess(data)
+
+        models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
+
+        face_mask = inputs.pop("face_mask", None)
+        hand_mask = inputs.pop("hand_mask", None)
+        depth_context = inputs.pop("depth_context", None)
+
+        if getattr(self, '_consisid', False):
+            _d = self.pipe.dit
+            _p0 = next(_d.parameters()); _dt = _p0.dtype; _dev = _p0.device
+            _pi = data['person_image']
+            _path = data.get("person_image_path", None)
+            _clip = self.pipe.image_encoder.encode_image([self.pipe.preprocess_image(_pi)]).to(_dev, _dt)
+            _arc_np, _face_detected = self._consisid_arcface.encode(_pi, _path)
+            _arc = torch.from_numpy(_arc_np).unsqueeze(0).to(_dev, _dt)
+            _d._consisid_id_tokens = _d.consisid_extractor(_arc, [_clip])
+            _active_dit = models.get("dit")
+            if _active_dit is not None:
+                # The training_loss call receives the DIT through `models`; mirror
+                # runtime ConsisID attributes onto that exact object so the active
+                # S2V block path cannot miss the identity tokens.
+                for _attr in (
+                    "_consisid_id_tokens",
+                    "_consisid_enabled",
+                    "consisid_interval",
+                    "consisid_start_block",
+                    "consisid_extractor",
+                    "consisid_cross_attn",
+                ):
+                    if hasattr(_d, _attr):
+                        setattr(_active_dit, _attr, getattr(_d, _attr))
+            if not self._consisid_debug_printed:
+                _tok = _d._consisid_id_tokens.detach()
+                print(
+                    "[ConsisID] real id tokens ready: "
+                    f"arc_norm={float(_arc.float().norm(dim=1).mean().item()):.4f}, "
+                    f"clip_shape={tuple(_clip.shape)}, "
+                    f"tokens_shape={tuple(_tok.shape)}, "
+                    f"tokens_requires_grad={_d._consisid_id_tokens.requires_grad}, "
+                    f"first_ca_requires_grad={next(_d.consisid_cross_attn.parameters()).requires_grad}, "
+                    f"models_dit_same={_active_dit is _d}, "
+                    f"models_dit_has_tokens={hasattr(_active_dit, '_consisid_id_tokens') if _active_dit is not None else False}, "
+                    f"face_detected={_face_detected}, "
+                    f"person_image_path={_path}"
+                )
+                self._consisid_debug_printed = True
+        loss = self.pipe.training_loss(
+            **models, **inputs,
+            face_mask=face_mask,
+            hand_mask=hand_mask,
+            depth_context=depth_context,
+            use_deepspeed_activation_checkpointing=self.use_deepspeed_activation_checkpointing,
+        )
+        if getattr(self, '_consisid', False) and self._consisid_debug_printed:
+            _loss_tensor = loss.get("loss") if isinstance(loss, dict) else loss
+            print(
+                "[ConsisID] loss_requires_grad="
+                f"{getattr(_loss_tensor, 'requires_grad', None)}, "
+                f"loss_grad_fn={type(_loss_tensor.grad_fn).__name__ if getattr(_loss_tensor, 'grad_fn', None) is not None else None}"
+            )
+        return loss
+
+
+if __name__ == "__main__":
+    parser = wan_parser()
+    args = parser.parse_args()
+
+    # Define data fields to load from CSV
+    data_file_keys = (
+        "motion_video,input_video,audio,person_image,"
+        "product_image,pose_video,face,hand_object,height,width,scale"
+    ).split(",")
+    if args.use_depth_branch:
+        data_file_keys.append("hoi_video")
+
+    # Data loading operators for each CSV field
+    special_operator_map = {
+        "motion_video": (
+            ToAbsolutePath(args.dataset_base_path)
+            >> LoadVideoFramesOnly(73, frame_processor=ImageCropAndResize(
+                args.height, args.width, None, 16, 16))
+        ),
+        "input_video": (
+            ToAbsolutePath(args.dataset_base_path)
+            >> LoadVideoFramesOnly(args.num_frames, frame_processor=ImageCropAndResize(
+                args.height, args.width, None, 16, 16))
+        ),
+        "person_image": (
+            ToAbsolutePath(args.dataset_base_path)
+            >> LoadImage()
+            >> ImageCropAndResize(args.height, args.width, None, 16, 16)
+        ),
+        "audio": (
+            ToAbsolutePath(args.dataset_base_path)
+            >> LoadAudio(sample_rate=16000)
+        ),
+        "product_image": (
+            ToAbsolutePath(args.dataset_base_path)
+            >> LoadImage()
+            >> ImageResizeAndPad(args.height, args.width, args.max_pixels, 16, 16)
+        ),
+        # Optional pose skeleton video (DWPose); leave the CSV cell empty to skip.
+        "pose_video": (
+            ToAbsolutePath(args.dataset_base_path)
+            >> LoadVideoFramesOnly(args.num_frames, frame_processor=ImageCropAndResize(
+                args.height, args.width, None, 16, 16))
+        ),
+        # Metadata fields (pass-through from CSV)
+        "face": lambda x: x,
+        "hand_object": lambda x: x,
+        "height": lambda x: int(x) if x else None,
+        "width": lambda x: int(x) if x else None,
+        "scale": lambda x: float(x) if x and str(x) != 'nan' else 1.0,
+    }
+
+    if args.use_depth_branch:
+        special_operator_map["hoi_video"] = (
+            ToAbsolutePath(args.dataset_base_path)
+            >> LoadVideoFramesOnly(args.num_frames, frame_processor=ImageCropAndResize(
+                args.height, args.width, None, 16, 16))
+        )
+
+    dataset = UnifiedDataset(
+        base_path=args.dataset_base_path,
+        metadata_path=args.dataset_metadata_path,
+        repeat=args.dataset_repeat,
+        data_file_keys=data_file_keys,
+        main_data_operator=None,
+        special_operator_map=special_operator_map,
+    )
+
+    model = WanTrainingModule(
+        model_paths=args.model_paths,
+        model_id_with_origin_paths=args.model_id_with_origin_paths,
+        trainable_models=args.trainable_models,
+        lora_base_model=args.lora_base_model,
+        lora_target_modules=args.lora_target_modules,
+        lora_rank=args.lora_rank,
+        lora_checkpoint=args.lora_checkpoint,
+        use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+        extra_inputs=args.extra_inputs,
+        max_timestep_boundary=args.max_timestep_boundary,
+        min_timestep_boundary=args.min_timestep_boundary,
+        height=args.height,
+        width=args.width,
+        use_moe=args.use_moe,
+        expert_hidden_dim=args.expert_hidden_dim,
+        use_depth_branch=args.use_depth_branch,
+        depth_mutual_visible=args.depth_mutual_visible,
+        use_deepspeed_activation_checkpointing=args.use_deepspeed_activation_checkpointing,
+        train_shift=args.train_shift,
+        use_audio_face_mask=args.use_audio_face_mask,
+        audio_mask_train_source=args.audio_mask_train_source,
+        pose_dropout_prob=args.pose_dropout_prob,
+        face_loss_weight=args.face_loss_weight,
+    )
+
+    model_logger = ModelLogger(
+        args.output_path,
+        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+    )
+
+    launch_training_task(dataset, model, model_logger, args=args)

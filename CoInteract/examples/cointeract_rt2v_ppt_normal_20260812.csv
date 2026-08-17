@@ -1,0 +1,4 @@
+sample_id,prompt,audio,person_image,product_image,pose_video
+rt2v_ppt_001_ok_normal,"Make an OK sign with one hand. Raise one hand and form an OK sign with fingers.",,/data1/workspace/linxinliang/InteractAvatar/InterDemo/test_data/ref_img/halfbody/fullImage4d7b62b981f995495a9051a66459910092859bbe.jpg,,
+rt2v_ppt_003_ok_normal,"Make an OK sign with one hand. Raise one hand and form an OK sign with fingers.",,/data1/workspace/linxinliang/InteractAvatar/InterDemo/test_data/ref_img/halfbody/fullImage2423d0176e605ccff7d64febbb6ee56d06dffda9.jpg,,
+rt2v_ppt_008_wave_normal,"Wave slowly with both hands for greeting. Raise both hands slowly and wave both hands side to side for greeting.",,/data1/workspace/linxinliang/InteractAvatar/InterDemo/test_data/ref_img/halfbody/fullImage8c4fd21edc6476f7c9735ad6b728c1e9d4e355e1.jpg,,

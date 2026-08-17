@@ -1,0 +1,2 @@
+sample_id,prompt,audio,person_image,product_image,pose_video
+th_fullbody_001_custom_motion1_refkv_strong,"A full-body person follows the provided motion with stable facial identity, stable eyes, stable nose, stable lips, stable jawline, and stable whole-body proportions.",,/data1/workspace/linxinliang/InteractAvatar/InterDemo/TalkingHumanDemo_fullbody/test_data/ref_img/wholebody/fullImage1a3b5329d192f028c14bc03d20c24afa629a3123.jpg,,/data1/workspace/linxinliang/InteractAvatar/InterDemo/custom_motion/dwpose/motion1_pose.mp4

@@ -1,0 +1,2 @@
+sample_id,prompt,audio,person_image,product_image,pose_video
+rt2v_ppt_008_wave_transition,"Start from the exact same pose as the reference image. Hold the starting pose briefly. Then slowly raise both hands and gradually wave both hands side to side for greeting. Keep the body position, camera framing, head position, and face stable. The motion should be continuous with no sudden pose jump.",,/data1/workspace/linxinliang/InteractAvatar/InterDemo/test_data/ref_img/halfbody/fullImage8c4fd21edc6476f7c9735ad6b728c1e9d4e355e1.jpg,,

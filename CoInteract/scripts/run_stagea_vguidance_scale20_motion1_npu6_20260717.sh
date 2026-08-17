@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /data1/workspace/linxinliang/CoInteract
+source /data1/miniconda3/etc/profile.d/conda.sh
+conda activate cointeract
+
+export ASCEND_RT_VISIBLE_DEVICES=6
+export PYTHONUNBUFFERED=1
+
+python batch_infer.py \
+  --base_model_path /data1/Wan-AI/wan22_s2v \
+  --audio_encoder_path /data1/workspace/linxinliang/CoInteract/models/chinese-wav2vec2-large \
+  --lora_path /data1/workspace/linxinliang/CoInteract/models/CoInteract/checkpoint_pose.safetensors \
+  --csv_path examples/th_fullbody_001_custom_motion1_noaudio_baseline_20260716.csv \
+  --data_base_path /data1/workspace/linxinliang/CoInteract \
+  --output_dir output_videos/p2v_stagea_vguidance_scale20_motion1_npu6_20260717 \
+  --height 832 \
+  --width 480 \
+  --num_frames 80 \
+  --num_clips 1 \
+  --num_inference_steps 40 \
+  --cfg_scale 7.0 \
+  --sigma_shift 7.0 \
+  --reference_compose_mode stretch \
+  --no_resize_output_to_reference \
+  --face_reference_guidance_scale 2.0 \
+  --face_reference_guidance_power 1.0 \
+  --face_reference_guidance_start_t 0.0 \
+  --face_reference_guidance_end_t 0.9

@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+Phase-0 ID-drift metric for P2V / TIA2V outputs.
+
+Measures how well a generated video preserves the reference person's identity
+over time, using an ArcFace ONNX recognizer run through onnxruntime (no
+insightface dependency).
+
+For each sampled frame:
+  - detect the (largest) face  [OpenCV Haar cascade by default, or supplied bbox JSON]
+  - crop + resize to the ArcFace input size, embed, L2-normalize
+  - cosine similarity vs the REFERENCE image face  -> cos_ref  (absolute identity)
+  - cosine similarity vs the FIRST valid generated frame -> cos_first (self-consistency / drift)
+
+Outputs a CSV (per-frame) and a printed summary (mean/min cos_ref, and the
+linear drift slope of cos_ref over time -> negative slope == identity drifting away).
+
+Notes / limitations:
+  - Haar detection + center-resize is a rough alignment (no 5-point landmarks),
+    so ABSOLUTE cosine values are conservative; the *trend/slope over time* is the
+    reliable signal for drift. Pass --bbox_json (per-frame face boxes, same format
+    as the dataset 'face' column) for tighter, dataset-consistent crops.
+  - Standard ArcFace preprocessing assumed: RGB, (x-127.5)/127.5, NCHW. Input size
+    is auto-read from the ONNX (falls back to 112x112).
+
+Example:
+  python eval/id_drift_metric.py \
+    --video output_videos/.../007_a2v_en_30s_stableavatar.mp4 \
+    --reference examples/.../007_ref.png \
+    --arcface_onnx models/arcface/w600k_r50.onnx \
+    --every 5 --out_csv /tmp/iddrift_007.csv
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+import cv2
+import numpy as np
+
+try:
+    import onnxruntime as ort
+except Exception as e:  # pragma: no cover
+    print(f"[fatal] onnxruntime import failed: {e}", file=sys.stderr)
+    sys.exit(2)
+
+
+# ----------------------------- ArcFace recognizer -----------------------------
+class ArcFaceONNX:
+    def __init__(self, onnx_path: str, providers=None):
+        if not os.path.isfile(onnx_path):
+            raise FileNotFoundError(f"ArcFace ONNX not found: {onnx_path}")
+        providers = providers or ["CPUExecutionProvider"]
+        self.sess = ort.InferenceSession(onnx_path, providers=providers)
+        self.input = self.sess.get_inputs()[0]
+        self.input_name = self.input.name
+        # input shape like [1,3,112,112]; dims may be symbolic (str/None)
+        shape = self.input.shape
+        h = shape[2] if isinstance(shape[2], int) else 112
+        w = shape[3] if isinstance(shape[3], int) else 112
+        self.size = (int(w), int(h))
+        self.output_name = self.sess.get_outputs()[0].name
+
+    def embed(self, face_bgr: np.ndarray) -> np.ndarray:
+        img = cv2.resize(face_bgr, self.size, interpolation=cv2.INTER_LINEAR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+        img = (img - 127.5) / 127.5
+        blob = np.transpose(img, (2, 0, 1))[None, ...]  # NCHW
+        emb = self.sess.run([self.output_name], {self.input_name: blob})[0][0]
+        n = np.linalg.norm(emb) + 1e-9
+        return emb / n
+
+
+# ----------------------------- face detection --------------------------------
+class HaarDetector:
+    def __init__(self):
+        xml = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        self.cascade = cv2.CascadeClassifier(xml)
+
+    def largest_face(self, frame_bgr: np.ndarray):
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        faces = self.cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        if len(faces) == 0:
+            return None
+        x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+        return int(x), int(y), int(x + w), int(y + h)
+
+
+def crop_face(frame_bgr: np.ndarray, box, margin: float = 0.2):
+    H, W = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = box
+    bw, bh = x2 - x1, y2 - y1
+    x1 = max(0, int(x1 - margin * bw)); y1 = max(0, int(y1 - margin * bh))
+    x2 = min(W, int(x2 + margin * bw)); y2 = min(H, int(y2 + margin * bh))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame_bgr[y1:y2, x1:x2]
+
+
+def first_frame(path: str) -> np.ndarray:
+    if path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"cannot read reference image: {path}")
+        return img
+    cap = cv2.VideoCapture(path)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f"cannot read first frame of: {path}")
+    return frame
+
+
+def cos(a, b):
+    return float(np.dot(a, b))
+
+
+def load_bbox_json(path):
+    # dataset 'face' column format: {"frame_2":[x1,y1,x2,y2], ...}
+    with open(path) as f:
+        d = json.load(f)
+    out = {}
+    for k, v in d.items():
+        try:
+            idx = int(str(k).split("_")[-1])
+            out[idx] = [int(x) for x in v]
+        except Exception:
+            continue
+    return out
+
+
+def nearest_bbox(bboxes: dict, idx: int):
+    if not bboxes:
+        return None
+    keys = sorted(bboxes)
+    k = min(keys, key=lambda kk: abs(kk - idx))
+    return bboxes[k]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video", required=True)
+    ap.add_argument("--reference", required=True, help="reference image (or video; first frame used)")
+    ap.add_argument("--arcface_onnx", default="models/arcface/w600k_r50.onnx")
+    ap.add_argument("--every", type=int, default=5, help="sample every N frames")
+    ap.add_argument("--bbox_json", default=None, help="optional per-frame face bboxes (dataset 'face' format)")
+    ap.add_argument("--ref_bbox", default=None, help="optional 'x1,y1,x2,y2' for the reference face")
+    ap.add_argument("--out_csv", default=None)
+    args = ap.parse_args()
+
+    arc = ArcFaceONNX(args.arcface_onnx)
+    det = HaarDetector()
+    print(f"[info] ArcFace input size = {arc.size}")
+
+    # reference embedding
+    ref_img = first_frame(args.reference)
+    if args.ref_bbox:
+        rb = [int(x) for x in args.ref_bbox.split(",")]
+    else:
+        rb = det.largest_face(ref_img)
+    if rb is None:
+        print("[fatal] no face detected in reference; pass --ref_bbox x1,y1,x2,y2", file=sys.stderr)
+        sys.exit(3)
+    ref_crop = crop_face(ref_img, rb)
+    ref_emb = arc.embed(ref_crop)
+
+    bboxes = load_bbox_json(args.bbox_json) if args.bbox_json else {}
+
+    cap = cv2.VideoCapture(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    rows = []
+    first_emb = None
+    idx = -1
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        idx += 1
+        if idx % args.every != 0:
+            continue
+        box = nearest_bbox(bboxes, idx) if bboxes else det.largest_face(frame)
+        detected = box is not None
+        cos_ref = cos_first = float("nan")
+        if detected:
+            crop = crop_face(frame, box)
+            if crop is not None and crop.size > 0:
+                emb = arc.embed(crop)
+                if first_emb is None:
+                    first_emb = emb
+                cos_ref = cos(emb, ref_emb)
+                cos_first = cos(emb, first_emb)
+        rows.append((idx, idx / fps, cos_ref, cos_first, int(detected)))
+    cap.release()
+
+    valid = [r for r in rows if not np.isnan(r[2])]
+    if not valid:
+        print("[warn] no faces detected in the generated video.")
+        return
+    cr = np.array([r[2] for r in valid])
+    t = np.array([r[1] for r in valid])
+    slope = float(np.polyfit(t, cr, 1)[0]) if len(valid) > 1 else 0.0
+    print("==== ID-drift summary ====")
+    print(f"frames sampled:      {len(rows)}  (faces detected: {len(valid)})")
+    print(f"cos_ref  mean/min:   {cr.mean():.3f} / {cr.min():.3f}")
+    print(f"cos_ref  first/last: {cr[0]:.3f} / {cr[-1]:.3f}")
+    print(f"drift slope (cos/s): {slope:+.4f}   (negative == identity drifting away)")
+
+    if args.out_csv:
+        os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
+        with open(args.out_csv, "w") as f:
+            f.write("frame,time_s,cos_ref,cos_first,detected\n")
+            for r in rows:
+                f.write(f"{r[0]},{r[1]:.3f},{r[2]:.4f},{r[3]:.4f},{r[4]}\n")
+        print(f"[info] wrote {args.out_csv}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+sample_id,prompt,audio,person_image,product_image,pose_video
+th_fullbody_sugar_motion4_noaudio_noproduct,"A full-body young woman with long black hair and stable facial identity follows the provided pose motion with natural full-body movement, stable hands, stable face, stable clothing, and no identity drift.",,/data1/workspace/linxinliang/InteractAvatar/InterDemo/TalkingHumanDemo_fullbody/test_data/ref_img/wholebody/sugar.jpg,,/data1/workspace/linxinliang/InteractAvatar/InterDemo/TalkingHumanDemo_fullbody/test_data/motion_pose/004_motion.mp4

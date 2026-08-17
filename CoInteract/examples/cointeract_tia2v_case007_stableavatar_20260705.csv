@@ -1,0 +1,2 @@
+sample_id,prompt,audio,person_image,product_image
+007_a2v_en_30s_stableavatar,"A young man outdoors in a half-body shot speaks clearly to the camera with stable lip-sync, steady facial identity, natural upper-body motion, stable eyes, stable nose, stable lips, and minimal appearance drift over time.",/data1/workspace/linxinliang/InteractAvatar/InterDemo/TalkingHumanDemo_fullbody/test_data/audio/Beyonce.m4a,/data1/workspace/linxinliang/InteractAvatar/InterDemo/TalkingHumanDemo_fullbody/test_data/ref_img/halfbody/fullImage110a004b18550a5c7252dd647048baf276d426a5.jpg,
