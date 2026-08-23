@@ -1,0 +1,120 @@
+{
+  "name": "p2v_geometry_face_control_20260823",
+  "description": "Training-free geometry-control prototype: replace generic DWPose face landmarks with reference-person InsightFace 3D-68 landmarks re-posed to the driving head orientation, then test with/without mild reference K/V guidance.",
+  "cwd": "/data1/workspace/linxinliang/CoInteract",
+  "npu": "7",
+  "env": {
+    "PYTHONUNBUFFERED": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+    "PYTORCH_NPU_ALLOC_CONF": "max_split_size_mb:256,garbage_collection_threshold:0.8"
+  },
+  "log_dir": "logs/p2v_geometry_face_control_20260823",
+  "python_executable": "/data1/miniconda3/envs/cointeract/bin/python",
+  "batch_infer": "batch_infer.py",
+  "base_batch_args": {
+    "base_model_path": "./models/Wan2.2-S2V-14B",
+    "audio_encoder_path": "./models/chinese-wav2vec2-large",
+    "height": 832,
+    "width": 480,
+    "num_frames": 80,
+    "num_clips": 1,
+    "num_inference_steps": 40,
+    "cfg_scale": 7.0,
+    "sigma_shift": 7.0,
+    "lora_path": "./models/CoInteract/checkpoint_pose.safetensors",
+    "reference_compose_mode": "stretch"
+  },
+  "base_batch_flags": [
+    "no_resize_output_to_reference"
+  ],
+  "variants": [
+    {
+      "name": "00_motion1_origpose_baseline",
+      "runner": "batch_infer",
+      "args": {
+        "csv_path": "examples/p2v_geometry_face_control_20260823_motion1_orig.csv",
+        "output_dir": "output_videos/p2v_geometry_face_control_20260823/00_motion1_origpose_baseline"
+      }
+    },
+    {
+      "name": "01_motion1_idface_baseline",
+      "runner": "batch_infer",
+      "args": {
+        "csv_path": "examples/p2v_geometry_face_control_20260823_motion1_idface.csv",
+        "output_dir": "output_videos/p2v_geometry_face_control_20260823/01_motion1_idface_baseline"
+      }
+    },
+    {
+      "name": "02_motion1_idface_refkv005",
+      "runner": "batch_infer",
+      "args": {
+        "csv_path": "examples/p2v_geometry_face_control_20260823_motion1_idface.csv",
+        "output_dir": "output_videos/p2v_geometry_face_control_20260823/02_motion1_idface_refkv005",
+        "reference_kv_guidance_scale": 0.05,
+        "reference_kv_guidance_mode": "head_attn",
+        "reference_kv_guidance_blocks": "10:22",
+        "reference_kv_guidance_start_t": 0.05,
+        "reference_kv_guidance_end_t": 0.75
+      }
+    },
+    {
+      "name": "03_motion1_idface_dv_latblur_apg",
+      "runner": "batch_infer",
+      "args": {
+        "csv_path": "examples/p2v_geometry_face_control_20260823_motion1_idface.csv",
+        "output_dir": "output_videos/p2v_geometry_face_control_20260823/03_motion1_idface_dv_latblur_apg",
+        "face_reference_guidance_scale": 1.0,
+        "face_reference_guidance_counterfactual": "latent_blur",
+        "face_reference_guidance_blur_kernel": 5,
+        "face_reference_guidance_samg": true,
+        "face_reference_guidance_samg_min_mult": 0.5,
+        "face_reference_guidance_samg_max_mult": 1.5,
+        "face_reference_guidance_apg_eta": 0.25
+      }
+    },
+    {
+      "name": "04_motion2_origpose_baseline",
+      "runner": "batch_infer",
+      "args": {
+        "csv_path": "examples/p2v_geometry_face_control_20260823_motion2_orig.csv",
+        "output_dir": "output_videos/p2v_geometry_face_control_20260823/04_motion2_origpose_baseline"
+      }
+    },
+    {
+      "name": "05_motion2_idface_baseline",
+      "runner": "batch_infer",
+      "args": {
+        "csv_path": "examples/p2v_geometry_face_control_20260823_motion2_idface.csv",
+        "output_dir": "output_videos/p2v_geometry_face_control_20260823/05_motion2_idface_baseline"
+      }
+    },
+    {
+      "name": "06_motion2_idface_refkv005",
+      "runner": "batch_infer",
+      "args": {
+        "csv_path": "examples/p2v_geometry_face_control_20260823_motion2_idface.csv",
+        "output_dir": "output_videos/p2v_geometry_face_control_20260823/06_motion2_idface_refkv005",
+        "reference_kv_guidance_scale": 0.05,
+        "reference_kv_guidance_mode": "head_attn",
+        "reference_kv_guidance_blocks": "10:22",
+        "reference_kv_guidance_start_t": 0.05,
+        "reference_kv_guidance_end_t": 0.75
+      }
+    },
+    {
+      "name": "07_motion2_idface_dv_latblur_apg",
+      "runner": "batch_infer",
+      "args": {
+        "csv_path": "examples/p2v_geometry_face_control_20260823_motion2_idface.csv",
+        "output_dir": "output_videos/p2v_geometry_face_control_20260823/07_motion2_idface_dv_latblur_apg",
+        "face_reference_guidance_scale": 1.0,
+        "face_reference_guidance_counterfactual": "latent_blur",
+        "face_reference_guidance_blur_kernel": 5,
+        "face_reference_guidance_samg": true,
+        "face_reference_guidance_samg_min_mult": 0.5,
+        "face_reference_guidance_samg_max_mult": 1.5,
+        "face_reference_guidance_apg_eta": 0.25
+      }
+    }
+  ]
+}
