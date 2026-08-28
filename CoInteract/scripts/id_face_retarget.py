@@ -54,6 +54,45 @@ def similarity_align(src, dst):
     return (scale * (src @ R.T)) + (mu_d - scale * (mu_s @ R.T))
 
 
+FACE_MESH_EDGES = [
+    *[(i, i + 1) for i in range(0, 16)],
+    *[(i, i + 1) for i in range(17, 21)],
+    *[(i, i + 1) for i in range(22, 26)],
+    *[(i, i + 1) for i in range(27, 30)],
+    *[(i, i + 1) for i in range(31, 35)],
+    (30, 33),
+    *[(i, i + 1) for i in range(36, 41)],
+    (41, 36),
+    *[(i, i + 1) for i in range(42, 47)],
+    (47, 42),
+    *[(i, i + 1) for i in range(48, 59)],
+    (59, 48),
+    *[(i, i + 1) for i in range(60, 67)],
+    (67, 60),
+]
+
+
+def overlay_face_mesh(pose_img_hwc_rgb: np.ndarray, face_norm: np.ndarray | None, alpha: float, radius: int):
+    """Overlay a DWPose-compatible face wireframe from the retargeted identity landmarks."""
+    if face_norm is None or len(face_norm) < 68 or alpha <= 0:
+        return pose_img_hwc_rgb
+    h, w = pose_img_hwc_rgb.shape[:2]
+    pts = np.asarray(face_norm[:68], dtype=np.float32) * np.array([w, h], dtype=np.float32)
+    overlay = pose_img_hwc_rgb.copy()
+    color = (80, 220, 255)
+    thickness = max(1, int(radius))
+    for a, b in FACE_MESH_EDGES:
+        p0 = tuple(np.round(pts[a]).astype(int))
+        p1 = tuple(np.round(pts[b]).astype(int))
+        if 0 <= p0[0] < w and 0 <= p0[1] < h and 0 <= p1[0] < w and 0 <= p1[1] < h:
+            cv2.line(overlay, p0, p1, color, thickness, cv2.LINE_AA)
+    for p in pts:
+        x, y = np.round(p).astype(int)
+        if 0 <= x < w and 0 <= y < h:
+            cv2.circle(overlay, (int(x), int(y)), thickness, color, -1, cv2.LINE_AA)
+    return cv2.addWeighted(overlay, float(alpha), pose_img_hwc_rgb, 1.0 - float(alpha), 0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--driving_video", required=True)  # raw RGB motion video
@@ -64,7 +103,14 @@ def main():
     ap.add_argument("--fps", type=float, default=25.0)
     ap.add_argument("--max_frames", type=int, default=0, help="Optional cap before DWPose detection; 0 keeps all frames.")
     ap.add_argument("--blend", type=float, default=1.0, help="1=full identity landmarks, 0=driving")
+    ap.add_argument("--mesh_overlay_alpha", type=float, default=0.0, help="Overlay identity face wireframe after DWPose rendering.")
+    ap.add_argument("--mesh_overlay_radius", type=int, default=1, help="Line/point radius for identity face wireframe.")
     args = ap.parse_args()
+    print(
+        f"[method] blend={args.blend:.3f} mesh_alpha={args.mesh_overlay_alpha:.3f} "
+        f"mesh_radius={args.mesh_overlay_radius}",
+        flush=True,
+    )
 
     app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
     app.prepare(ctx_id=-1, det_size=(640, 640))
@@ -110,12 +156,16 @@ def main():
             aligned = similarity_align(proj, drv_px)        # overlay driving position/scale/roll
             new_face = aligned / np.array([W, H])           # back to normalized
             faces[0] = args.blend * new_face + (1 - args.blend) * faces[0]
+            identity_face = faces[0].copy()
             pose["faces"] = faces
             n_id += 1
         else:
+            identity_face = None
             n_fallback += 1
         canvas = draw_pose(pose, H, W)  # (3,H,W) rgb
-        out_frames.append(canvas.transpose(1, 2, 0))
+        frame = canvas.transpose(1, 2, 0)
+        frame = overlay_face_mesh(frame, identity_face, args.mesh_overlay_alpha, args.mesh_overlay_radius)
+        out_frames.append(frame)
 
     if yaws:
         ya = np.array(yaws)

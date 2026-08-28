@@ -33,6 +33,8 @@ Variants:
 
 ## Next research upgrades
 
+- Safer landmark retargeting: partial blends (`0.5`, `0.75`) instead of replacing the full DWPose face.
+- DWPose-compatible face mesh overlay: draw a richer identity face wireframe into the control image without changing channels.
 - Replace InsightFace 3D-68 with DECA/FLAME identity shape.
 - Render dense identity-specific face proxy controls: mesh lines, normals, depth, or visibility.
 - Build a synthetic multi-view face bank from the fitted 3D identity.
